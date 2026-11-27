@@ -3,8 +3,12 @@
 set -uo pipefail
 export LC_ALL=C
 umask 077
-VERSION=0.3.0
-DISK_DIR="$PWD"; SIZE=128; NODE=all; ACCEPT=0; MODE=; FAILED=0; WORK=; RUNWORK=; DEP_MODE=; INSTALL_YES=0; VENDOR_DIR=; VENDOR_BUILD=; VENDOR_HASH=; VENDOR_BIN=
+VERSION=0.4.0
+DISK_DIR="$PWD"; SIZE=128; NODE=all; ACCEPT=0; MODE=; FAILED=0; WORK=; RUNWORK=; DEP_MODE=; INSTALL_YES=0; VENDOR_DIR=; VENDOR_BUILD=; VENDOR_HASH=; VENDOR_BIN=; VENDOR_REF=; GH_SOURCE=; GH_CUSTOM=; INTERACTIVE=0
+# Release maintainers fill these only after approving an archived build.
+APPROVED_REF=; APPROVED_BUILD=; APPROVED_AMD64_HASH=; APPROVED_ARM64_HASH=
+declare -a GH_PUBLIC=(https://gh-proxy.com https://ghfast.top https://ghproxy.net)
+declare -a GH_ROUTES=()
 declare -a NODES=(
   "london|London, GB|35057|Clouvider"
   "frankfurt|Frankfurt, DE|35692|Clouvider"
@@ -27,11 +31,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 usage(){ cat <<'EOF'
-LinuxBench 0.3.0
+LinuxBench 0.4.0
   No arguments: interactive menu (requires controlling TTY)
   --portable            No package installation (default for direct flags)
   --install-mode        Permit installing missing open-source dependencies (APT)
-  --vendor-dir DIR      Local approved dependency archive root
+  --vendor-dir DIR      Local approved dependency archive root (offline)
+  --vendor-ref SHA      Immutable LinuxBench Git commit containing archives
+  --github-source MODE  direct (default), auto (public -> direct -> custom), custom
+  --github-proxy URL    Optional GAD-compatible HTTPS prefix for auto/custom
   --vendor-build ID     Explicit archived build ID
   --vendor-hash SHA256  Independently approved manifest hash
   --yes                 Confirm package installation non-interactively
@@ -45,23 +52,112 @@ LinuxBench 0.3.0
   --size-mib N         Disk test file size, 64..512 (default 128)
   --accept-ookla       Explicit consent to Ookla terms and network test traffic
   --version / --help
-Portable mode never installs packages. Install mode uses configured APT sources;
+Portable mode downloads only approved LinuxBench repository files (or uses a local archive).
+Public proxy auto mode is opt-in; direct is the default. Install mode uses configured APT sources;
 network tests still require an independently verified official Ookla CLI.
 Portable mode cleans wrapper-owned temporary files; system logs may remain.
 EOF
 }
 choose(){ [[ -z "$MODE" ]] || die "Choose exactly one mode"; MODE="$1"; }
 dep_choose(){ [[ -z "$DEP_MODE" || "$DEP_MODE" == "$1" ]] || die "Conflicting dependency modes"; DEP_MODE="$1"; }
+valid_proxy(){
+  local p="$1"
+  [[ "$p" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$ && "$p" != *..* ]]
+}
+download_raw(){
+  local route="$1" path="$2" dest="$3" sha="$4" budget="$5"
+  local url="https://raw.githubusercontent.com/smmya/linuxbench/$VENDOR_REF/$path"
+  [[ "$route" == direct ]] || url="$route/$url"
+  rm -f -- "$dest"
+  # No curlrc/wgetrc, cookies, tokens or TLS bypass. Cap each file at 64 MiB.
+  if has curl; then
+    (ulimit -f 65536; curl -q -fLsS --proto '=https' --proto-redir '=https' --max-redirs 3 --connect-timeout 5 --max-time "$budget" --max-filesize 67108864 --output "$dest" -- "$url") 2>/dev/null || { rm -f -- "$dest"; return 1; }
+  elif has wget && has timeout; then
+    # GNU wget: reject redirects rather than risk downgrade on older versions.
+    (ulimit -f 65536; timeout -k 2s "${budget}s" wget --no-config --https-only --max-redirect=0 --timeout=5 --tries=1 -q -O "$dest" -- "$url") 2>/dev/null || { rm -f -- "$dest"; return 1; }
+  else
+    warn "Remote archive needs curl, or GNU wget and timeout"
+    return 1
+  fi
+  if ! printf '%s  %s\n' "$sha" "$dest" | sha256sum -c --status -; then
+    warn "Integrity mismatch from $route; refusing file"
+    rm -f -- "$dest"
+    return 1
+  fi
+}
+remote_manifest(){
+  local path="$1" dest="$2" route
+  local -a candidates=()
+  GH_ROUTES=()
+  case "$GH_SOURCE" in
+    direct) candidates=(direct);;
+    auto) candidates=("${GH_PUBLIC[@]}" direct); [[ -z "$GH_CUSTOM" ]] || candidates+=("$GH_CUSTOM");;
+    custom) candidates=("$GH_CUSTOM");;
+    *) return 1;;
+  esac
+  # Public sources in fixed preference order; direct before the optional private fallback.
+  # Probe lazily, on the first successful verified manifest stop; remaining routes
+  # are available for per-file fallback and independently checked against its hash.
+  local found=0
+  for route in "${candidates[@]}"; do
+    if (( found )); then GH_ROUTES+=("$route"); continue; fi
+    printf '[DOWNLOAD] Probe %s\n' "$route" >&2
+    if download_raw "$route" "$path" "$dest" "$VENDOR_HASH" 12; then
+      GH_ROUTES+=("$route")
+      found=1
+      printf '[DOWNLOAD] Verified source: %s\n' "$route" >&2
+    fi
+  done
+  (( found ))
+}
+remote_binary(){
+  local path="$1" dest="$2" sha="$3" route
+  for route in "${GH_ROUTES[@]}"; do
+    printf '[DOWNLOAD] %s via %s\n' "${path##*/}" "$route" >&2
+    if download_raw "$route" "$path" "$dest" "$sha" 90; then return 0; fi
+  done
+  return 1
+}
+download_menu(){
+  local c
+  if [[ "$INTERACTIVE" == 1 && -z "$GH_SOURCE" ]]; then
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then return 1; fi
+    printf '\nGitHub download source\n1) Direct (no acceleration)\n2) Auto (public first; recommended for mainland China)\n3) Custom GAD-compatible source only\n0) Exit\nSelect [1]: ' >&3
+    read -r c <&3 || c=0
+    case "$c" in 1|"") GH_SOURCE=direct;; 2) GH_SOURCE=auto;; 3) GH_SOURCE=custom;; 0) exit 0;; *) die "Invalid download source";; esac
+    if [[ "$GH_SOURCE" != direct && -z "$GH_CUSTOM" ]]; then
+      printf 'Custom HTTPS proxy (optional fallback in auto mode): ' >&3
+      read -r GH_CUSTOM <&3 || GH_CUSTOM=
+    fi
+    exec 3>&-
+  fi
+  GH_SOURCE=${GH_SOURCE:-direct}
+  GH_CUSTOM=${GH_CUSTOM%/}
+  [[ -z "$GH_CUSTOM" ]] || valid_proxy "$GH_CUSTOM" || die "Invalid HTTPS proxy prefix (no credentials, query or fragment)"
+  [[ "$GH_SOURCE" != custom || -n "$GH_CUSTOM" ]] || die "Custom mode requires --github-proxy"
+  [[ "$GH_SOURCE" != direct || -z "$GH_CUSTOM" ]] || die "Direct mode cannot use a custom proxy"
+}
 load_vendor(){
   [[ "$DEP_MODE" == portable ]] || return 0
   case "$MODE" in quick|nodes) return 0;; esac
   local arch manifest a tool sha path actual
   local -A seen=()
   case "$(uname -m)" in x86_64) arch=amd64;; aarch64) arch=arm64;; *) fail "Unsupported portable architecture"; return 1;; esac
-  [[ -n "$VENDOR_DIR" && "$VENDOR_BUILD" =~ ^[0-9]+-[0-9]+$ && "$VENDOR_HASH" =~ ^[a-f0-9]{64}$ ]] || { fail "Portable benchmarks require an approved local archive (--vendor-dir, --vendor-build, --vendor-hash); no unverified fallback"; return 1; }
-  manifest="$VENDOR_DIR/vendor/manifests/$VENDOR_BUILD.$arch.tsv"
+  # Approved release values are embedded in the trusted script, not fetched from a mirror.
+  if [[ -z "$VENDOR_BUILD" && -z "$VENDOR_REF" && -z "$VENDOR_HASH" ]]; then
+    VENDOR_BUILD="$APPROVED_BUILD"; VENDOR_REF="$APPROVED_REF"
+    case "$arch" in amd64) VENDOR_HASH="$APPROVED_AMD64_HASH";; arm64) VENDOR_HASH="$APPROVED_ARM64_HASH";; esac
+  fi
+  [[ "$VENDOR_BUILD" =~ ^[0-9]+-[0-9]+$ && "$VENDOR_HASH" =~ ^[a-f0-9]{64}$ ]] || { fail "No approved archive yet; supply --vendor-build and independently approved --vendor-hash"; return 1; }
+  manifest="vendor/manifests/$VENDOR_BUILD.$arch.tsv"
   prepare_runwork || return 1
-  cp -- "$manifest" "$RUNWORK/manifest" || return 1
+  if [[ -n "$VENDOR_DIR" ]]; then
+    cp -- "$VENDOR_DIR/$manifest" "$RUNWORK/manifest" || return 1
+  else
+    [[ "$VENDOR_REF" =~ ^[a-f0-9]{40}$ ]] || { fail "Remote archive requires immutable --vendor-ref"; return 1; }
+    download_menu || return 1
+    remote_manifest "$manifest" "$RUNWORK/manifest" || { fail "No verified download route"; return 1; }
+  fi
   printf '%s  %s\n' "$VENDOR_HASH" "$RUNWORK/manifest" | sha256sum -c - || return 1
   VENDOR_BIN="$RUNWORK/bin"
   mkdir -m 700 -- "$VENDOR_BIN" || return 1
@@ -73,7 +169,11 @@ load_vendor(){
     esac
     [[ "$path" != *..* && -z "${seen[$tool]:-}" ]] || return 1
     seen[$tool]=1
-    cp -- "$VENDOR_DIR/$path" "$VENDOR_BIN/$tool" || return 1
+    if [[ -n "$VENDOR_DIR" ]]; then
+      cp -- "$VENDOR_DIR/$path" "$VENDOR_BIN/$tool" || return 1
+    else
+      remote_binary "$path" "$VENDOR_BIN/$tool" "$sha" || return 1
+    fi
     printf '%s  %s\n' "$sha" "$VENDOR_BIN/$tool" | sha256sum -c - || return 1
     chmod 700 "$VENDOR_BIN/$tool" || return 1
   done < "$RUNWORK/manifest"
@@ -208,6 +308,7 @@ network(){
 }
 menu(){
   local choice
+  INTERACTIVE=1
   if ! { exec 3<>/dev/tty; } 2>/dev/null; then usage; die "No terminal; specify a mode"; fi
   if [[ -z "$DEP_MODE" ]]; then
     printf "\nLinuxBench %s - execution mode\n1) Portable (no package installation)\n2) Install mode (APT, explicit consent)\n0) Exit\nSelect [1]: " "$VERSION" >&3
@@ -223,6 +324,10 @@ while (( $# )); do
     --portable|--no-install) dep_choose portable;;
     --install-mode) dep_choose install;;
     --yes) INSTALL_YES=1;;
+    --github-source) (( $# >= 2 )) || die "Missing source mode"; case "$2" in direct|auto|custom) GH_SOURCE="$2";; *) die "Invalid source mode";; esac; shift;;
+    --github-proxy) (( $# >= 2 )) || die "Missing proxy URL"; GH_CUSTOM="$2"; shift;;
+    --no-proxy) GH_SOURCE=direct;;
+    --vendor-ref) (( $# >= 2 )) || die "Missing immutable ref"; VENDOR_REF="$2"; shift;;
     --vendor-dir) (( $# >= 2 )) || die "Missing vendor directory"; VENDOR_DIR="$2"; shift;;
     --vendor-build) (( $# >= 2 )) || die "Missing build ID"; VENDOR_BUILD="$2"; shift;;
     --vendor-hash) (( $# >= 2 )) || die "Missing manifest hash"; VENDOR_HASH="$2"; shift;;
