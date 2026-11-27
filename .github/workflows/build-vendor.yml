@@ -1,0 +1,93 @@
+name: Build portable dependencies
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Commit tested binaries and corresponding sources to main
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - build/**
+      - .github/workflows/build-vendor.yml
+permissions:
+  contents: read
+concurrency:
+  group: vendor-build
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build in musl environment
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker pull alpine:3.22
+          image=$(docker image inspect alpine:3.22 --format '{{.Id}}')
+          docker run --rm -v "$PWD:/work" -w /work -e BUILDER_IMAGE_ID="$image" "$image" sh -ec '
+            apk add --no-cache bash git build-base linux-headers autoconf automake libtool pkgconf bison flex texinfo
+            bash build/build-vendor.sh "$1" "$2"
+          ' sh "$ARCH" "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Smoke tests on multiple userspaces
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          for image in debian:11 debian:12 debian:13 ubuntu:20.04 ubuntu:24.04 alpine:3.22 rockylinux:9; do
+            docker run --rm --network none --read-only --tmpfs /tmp:exec,size=128m -v "$PWD:/work:ro" "$image" sh /work/build/smoke.sh /work/out "$ARCH"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: vendor-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: vendor-*
+          path: incoming
+      - name: Archive immutable build directories
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p vendor/manifests
+          id="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          for arch in amd64 arm64; do
+            src="incoming/vendor-$arch"
+            test "$(wc -l < "$src/manifest.$arch.tsv")" -eq 3
+            while IFS='|' read -r a tool sha path; do
+              test "$a" = "$arch"
+              test ! -e "$path"
+              printf '%s  %s\n' "$sha" "$src/$path" | sha256sum -c -
+            done < "$src/manifest.$arch.tsv"
+            cp -a "$src/vendor/." vendor/
+            cp "$src/manifest.$arch.tsv" "vendor/manifests/$id.$arch.tsv"
+          done
+          git config user.name linuxbench-build
+          git config user.email linuxbench-build@users.noreply.github.com
+          git add vendor
+          git commit -m "Archive tested portable dependency build $id"
+          git push origin HEAD:main
