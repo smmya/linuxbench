@@ -3,8 +3,8 @@
 set -uo pipefail
 export LC_ALL=C
 umask 077
-VERSION=0.2.0
-DISK_DIR="$PWD"; SIZE=128; NODE=all; ACCEPT=0; MODE=; FAILED=0; WORK=; RUNWORK=; DEP_MODE=; INSTALL_YES=0
+VERSION=0.3.0
+DISK_DIR="$PWD"; SIZE=128; NODE=all; ACCEPT=0; MODE=; FAILED=0; WORK=; RUNWORK=; DEP_MODE=; INSTALL_YES=0; VENDOR_DIR=; VENDOR_BUILD=; VENDOR_HASH=; VENDOR_BIN=
 declare -a NODES=(
   "london|London, GB|35057|Clouvider"
   "frankfurt|Frankfurt, DE|35692|Clouvider"
@@ -27,10 +27,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 usage(){ cat <<'EOF'
-LinuxBench 0.2.0
+LinuxBench 0.3.0
   No arguments: interactive menu (requires controlling TTY)
   --portable            No package installation (default for direct flags)
   --install-mode        Permit installing missing open-source dependencies (APT)
+  --vendor-dir DIR      Local approved dependency archive root
+  --vendor-build ID     Explicit archived build ID
+  --vendor-hash SHA256  Independently approved manifest hash
   --yes                 Confirm package installation non-interactively
   --quick / --info      Local system information only
   --standard           Information + sequential disk + single-core CPU + network
@@ -49,6 +52,34 @@ EOF
 }
 choose(){ [[ -z "$MODE" ]] || die "Choose exactly one mode"; MODE="$1"; }
 dep_choose(){ [[ -z "$DEP_MODE" || "$DEP_MODE" == "$1" ]] || die "Conflicting dependency modes"; DEP_MODE="$1"; }
+load_vendor(){
+  [[ "$DEP_MODE" == portable ]] || return 0
+  case "$MODE" in quick|nodes) return 0;; esac
+  local arch manifest a tool sha path actual
+  local -A seen=()
+  case "$(uname -m)" in x86_64) arch=amd64;; aarch64) arch=arm64;; *) fail "Unsupported portable architecture"; return 1;; esac
+  [[ -n "$VENDOR_DIR" && "$VENDOR_BUILD" =~ ^[0-9]+-[0-9]+$ && "$VENDOR_HASH" =~ ^[a-f0-9]{64}$ ]] || { fail "Portable benchmarks require an approved local archive (--vendor-dir, --vendor-build, --vendor-hash); no unverified fallback"; return 1; }
+  manifest="$VENDOR_DIR/vendor/manifests/$VENDOR_BUILD.$arch.tsv"
+  prepare_runwork || return 1
+  cp -- "$manifest" "$RUNWORK/manifest" || return 1
+  printf '%s  %s\n' "$VENDOR_HASH" "$RUNWORK/manifest" | sha256sum -c - || return 1
+  VENDOR_BIN="$RUNWORK/bin"
+  mkdir -m 700 -- "$VENDOR_BIN" || return 1
+  while IFS='|' read -r a tool sha path; do
+    [[ "$a" == "$arch" && "$sha" =~ ^[a-f0-9]{64}$ ]] || return 1
+    case "$tool:$path" in
+      jq:vendor/github.com/jqlang/jq/*/"$arch"/"$VENDOR_BUILD"/jq|fio:vendor/github.com/axboe/fio/*/"$arch"/"$VENDOR_BUILD"/fio|sysbench:vendor/github.com/akopytov/sysbench/*/"$arch"/"$VENDOR_BUILD"/sysbench) ;;
+      *) return 1;;
+    esac
+    [[ "$path" != *..* && -z "${seen[$tool]:-}" ]] || return 1
+    seen[$tool]=1
+    cp -- "$VENDOR_DIR/$path" "$VENDOR_BIN/$tool" || return 1
+    printf '%s  %s\n' "$sha" "$VENDOR_BIN/$tool" | sha256sum -c - || return 1
+    chmod 700 "$VENDOR_BIN/$tool" || return 1
+  done < "$RUNWORK/manifest"
+  [[ ${#seen[@]} == 3 ]] || return 1
+  export PATH="$VENDOR_BIN:$PATH"
+}
 install_deps(){
   [[ "$DEP_MODE" == install ]] || return 0
   local -a packages=() elevate=()
@@ -192,6 +223,9 @@ while (( $# )); do
     --portable|--no-install) dep_choose portable;;
     --install-mode) dep_choose install;;
     --yes) INSTALL_YES=1;;
+    --vendor-dir) (( $# >= 2 )) || die "Missing vendor directory"; VENDOR_DIR="$2"; shift;;
+    --vendor-build) (( $# >= 2 )) || die "Missing build ID"; VENDOR_BUILD="$2"; shift;;
+    --vendor-hash) (( $# >= 2 )) || die "Missing manifest hash"; VENDOR_HASH="$2"; shift;;
     --quick|--info) choose quick;;
     --standard|--full|--disk|--cpu|--memory|--network|--nodes) choose "${1#--}";;
     --disk-dir) (( $# >= 2 )) || die "Missing directory"; DISK_DIR="$2"; shift;;
@@ -211,6 +245,7 @@ fi
 [[ -n "$MODE" ]] || menu
 DEP_MODE=${DEP_MODE:-portable}
 [[ "$DEP_MODE" == install || "$INSTALL_YES" == 0 ]] || die "--yes requires --install-mode"
+load_vendor || die "Portable dependency verification failed"
 install_deps || exit "$FAILED"
 case "$MODE" in
   quick) info;; standard) info; disk 0; cpu 0; network;;
