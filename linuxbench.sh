@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# LinuxBench - local benchmark runner; no automatic installation or downloads.
+# LinuxBench - portable by default; system package installation requires opt-in.
 set -uo pipefail
 export LC_ALL=C
 umask 077
-VERSION=0.1.0
-DISK_DIR="$PWD"; SIZE=128; NODE=all; ACCEPT=0; MODE=; FAILED=0; WORK=
+VERSION=0.2.0
+DISK_DIR="$PWD"; SIZE=128; NODE=all; ACCEPT=0; MODE=; FAILED=0; WORK=; RUNWORK=; DEP_MODE=; INSTALL_YES=0
 declare -a NODES=(
   "london|London, GB|35057|Clouvider"
   "frankfurt|Frankfurt, DE|35692|Clouvider"
@@ -21,13 +21,17 @@ warn(){ printf "[WARN] %s\n" "$*" >&2; }
 fail(){ warn "$*"; FAILED=1; }
 die(){ warn "$*"; exit 2; }
 cleanup(){ if [[ -n "$WORK" ]]; then rm -rf -- "$WORK"; fi; }
-trap cleanup EXIT
+cleanup_all(){ cleanup; if [[ -n "$RUNWORK" ]]; then rm -rf -- "$RUNWORK"; fi; }
+trap cleanup_all EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 usage(){ cat <<'EOF'
-LinuxBench 0.1.0
+LinuxBench 0.2.0
   No arguments: interactive menu (requires controlling TTY)
+  --portable            No package installation (default for direct flags)
+  --install-mode        Permit installing missing open-source dependencies (APT)
+  --yes                 Confirm package installation non-interactively
   --quick / --info      Local system information only
   --standard           Information + sequential disk + single-core CPU + network
   --full               Information + disk incl. 4K + CPU + memory + network
@@ -38,11 +42,50 @@ LinuxBench 0.1.0
   --size-mib N         Disk test file size, 64..512 (default 128)
   --accept-ookla       Explicit consent to Ookla terms and network test traffic
   --version / --help
-No packages installed or downloaded; network tests require an independently
-trusted official Ookla CLI, jq, timeout, non-root user, and explicit consent.
+Portable mode never installs packages. Install mode uses configured APT sources;
+network tests still require an independently verified official Ookla CLI.
+Portable mode cleans wrapper-owned temporary files; system logs may remain.
 EOF
 }
 choose(){ [[ -z "$MODE" ]] || die "Choose exactly one mode"; MODE="$1"; }
+dep_choose(){ [[ -z "$DEP_MODE" || "$DEP_MODE" == "$1" ]] || die "Conflicting dependency modes"; DEP_MODE="$1"; }
+install_deps(){
+  [[ "$DEP_MODE" == install ]] || return 0
+  local -a packages=() elevate=()
+  case "$MODE" in
+    standard|full|disk) has fio || packages+=(fio); has jq || packages+=(jq);;
+  esac
+  case "$MODE" in
+    standard|full|cpu|memory) has sysbench || packages+=(sysbench);;
+  esac
+  case "$MODE" in
+    standard|full|network) if ! has jq && [[ " ${packages[*]} " != *" jq "* ]]; then packages+=(jq); fi;;
+  esac
+  case "$MODE" in
+    standard|full|cpu|memory|disk|network) has timeout || packages+=(coreutils);;
+  esac
+  (( ${#packages[@]} )) || return 0
+  has apt-get || { fail "Install mode currently supports APT only"; return 1; }
+  if (( EUID != 0 )); then has sudo || { fail "APT requires root or sudo"; return 1; }; elevate=(sudo); fi
+  printf "Missing packages: %s\n" "${packages[*]}"
+  warn "APT uses configured sources; dependencies may be installed or upgraded and remain on disk. No repository changes or automatic apt update."
+  if (( ! INSTALL_YES )); then
+    local reply
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then fail "Use --yes to authorize package installation without a TTY"; return 1; fi
+    printf "Install these packages? [y/N] " >&3
+    read -r reply <&3 || reply=; exec 3>&-
+    [[ "$reply" == y || "$reply" == Y ]] || { fail "Installation declined"; return 1; }
+  fi
+  "${elevate[@]}" apt-get install -y --no-install-recommends --no-remove "${packages[@]}" || { fail "APT failed; no automatic source or package-list changes attempted"; return 1; }
+}
+prepare_runwork(){
+  [[ -n "$RUNWORK" ]] && return 0
+  RUNWORK=$(mktemp -d -- "${TMPDIR:-/tmp}/linuxbench.XXXXXXXX") || { fail "Temporary directory creation failed"; return 1; }
+  mkdir -p -- "$RUNWORK/home" "$RUNWORK/config" "$RUNWORK/cache" "$RUNWORK/data" "$RUNWORK/state" "$RUNWORK/tmp" || { fail "Temporary setup failed"; return 1; }
+}
+ookla(){
+  env HOME="$RUNWORK/home" XDG_CONFIG_HOME="$RUNWORK/config" XDG_CACHE_HOME="$RUNWORK/cache" XDG_DATA_HOME="$RUNWORK/data" XDG_STATE_HOME="$RUNWORK/state" TMPDIR="$RUNWORK/tmp" "$@"
+}
 list_nodes(){ local row key city id provider; for row in "${NODES[@]}"; do IFS="|" read -r key city id provider <<< "$row"; printf "%-15s %-23s %-7s %s\n" "$key" "$city" "$id" "$provider"; done; }
 info(){
   printf "\n=== SYSTEM ===\n"; uname -srmo
@@ -114,14 +157,15 @@ network(){
     read -r line <&3 || line=; exec 3>&-
     [[ "$line" == y || "$line" == Y ]] || { fail "Network declined"; return; }
   fi
-  version=$(timeout -k 2s 5s speedtest --version 2>/dev/null) || { fail "Cannot identify speedtest"; return; }
+  prepare_runwork || return
+  version=$(ookla timeout -k 2s 5s speedtest --version 2>/dev/null) || { fail "Cannot identify speedtest"; return; }
   [[ "$version" == *"Ookla"* ]] || { fail "Not the official Ookla CLI (version check only, not provenance verification)"; return; }
   printf "%-23s %12s %12s %10s %10s\n" "Target" "Down Mbps" "Up Mbps" "RTT ms" "Data MiB"
   for row in "${NODES[@]}"; do
     IFS="|" read -r key city id provider <<< "$row"
     [[ "$NODE" == all || "$NODE" == "$key" ]] || continue
     count=$((count+1))
-    if result=$(timeout -k 5s 90s speedtest --accept-license --accept-gdpr --progress=no --format=json --server-id="$id" 2>/dev/null) &&
+    if result=$(ookla timeout -k 5s 90s speedtest --accept-license --accept-gdpr --progress=no --format=json --server-id="$id" 2>/dev/null) &&
        line=$(jq -er --arg id "$id" 'select(.type=="result" and (.server.id|tostring)==$id and (.download.bandwidth|type)=="number" and (.upload.bandwidth|type)=="number" and (.ping.latency|type)=="number" and (.download.bytes|type)=="number" and (.upload.bytes|type)=="number") | [.download.bandwidth*8/1000000,.upload.bandwidth*8/1000000,.ping.latency,(.download.bytes+.upload.bytes)/1048576] | @tsv' <<< "$result"); then
       local down up rtt bytes; IFS=$'\t' read -r down up rtt bytes <<< "$line"
       printf "%-23s %12.2f %12.2f %10.2f %10.2f\n" "$city" "$down" "$up" "$rtt" "$bytes"
@@ -134,12 +178,20 @@ network(){
 menu(){
   local choice
   if ! { exec 3<>/dev/tty; } 2>/dev/null; then usage; die "No terminal; specify a mode"; fi
+  if [[ -z "$DEP_MODE" ]]; then
+    printf "\nLinuxBench %s - execution mode\n1) Portable (no package installation)\n2) Install mode (APT, explicit consent)\n0) Exit\nSelect [1]: " "$VERSION" >&3
+    read -r choice <&3 || choice=0
+    case "$choice" in 1|"") DEP_MODE=portable;; 2) DEP_MODE=install;; 0) exit 0;; *) die "Invalid execution mode";; esac
+  fi
   printf "\nLinuxBench %s\n1) Quick / system info\n2) Standard\n3) Full\n4) Disk\n5) CPU\n6) Memory\n7) Network (9 locations)\n8) List nodes\n0) Exit\nSelect: " "$VERSION" >&3
   read -r choice <&3 || choice=; exec 3>&-
   case "$choice" in 1) MODE=quick;; 2) MODE=standard;; 3) MODE=full;; 4) MODE=disk;; 5) MODE=cpu;; 6) MODE=memory;; 7) MODE=network;; 8) MODE=nodes;; 0) exit 0;; *) die "Invalid selection";; esac
 }
 while (( $# )); do
   case "$1" in
+    --portable|--no-install) dep_choose portable;;
+    --install-mode) dep_choose install;;
+    --yes) INSTALL_YES=1;;
     --quick|--info) choose quick;;
     --standard|--full|--disk|--cpu|--memory|--network|--nodes) choose "${1#--}";;
     --disk-dir) (( $# >= 2 )) || die "Missing directory"; DISK_DIR="$2"; shift;;
@@ -157,6 +209,9 @@ if [[ "$NODE" != all ]]; then
   (( valid )) || die "Unknown node: $NODE"
 fi
 [[ -n "$MODE" ]] || menu
+DEP_MODE=${DEP_MODE:-portable}
+[[ "$DEP_MODE" == install || "$INSTALL_YES" == 0 ]] || die "--yes requires --install-mode"
+install_deps || exit "$FAILED"
 case "$MODE" in
   quick) info;; standard) info; disk 0; cpu 0; network;;
   full) info; disk 1; cpu 1; memory; network;;
