@@ -32,7 +32,19 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Build in musl environment
+      - name: Build jq in Debian 12 (static glibc)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker pull debian:12
+          image=$(docker image inspect debian:12 --format '{{.Id}}')
+          docker run --rm -v "$PWD:/work" -w /work -e BUILDER_IMAGE_ID="$image" "$image" sh -ec '
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git build-essential autoconf automake libtool pkg-config bison flex locales tzdata util-linux python3
+            bash build/build-vendor.sh "$1" "$2" jq
+          ' sh "$ARCH" "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Build fio and sysbench in musl environment
+        if: ${{ !cancelled() }}
         env:
           ARCH: ${{ matrix.arch }}
         run: |
@@ -40,14 +52,16 @@ jobs:
           image=$(docker image inspect alpine:3.22 --format '{{.Id}}')
           docker run --rm -v "$PWD:/work" -w /work -e BUILDER_IMAGE_ID="$image" "$image" sh -ec '
             apk add --no-cache bash git build-base linux-headers autoconf automake libtool pkgconf bison flex texinfo
-            bash build/build-vendor.sh "$1" "$2"
+            bash build/build-vendor.sh "$1" "$2" musl
           ' sh "$ARCH" "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
       - name: Smoke tests on multiple userspaces
         env:
           ARCH: ${{ matrix.arch }}
         run: |
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
           for image in debian:11 debian:12 debian:13 ubuntu:20.04 ubuntu:24.04 alpine:3.22 rockylinux:9; do
-            docker run --rm --network none --read-only --tmpfs /tmp:exec,size=128m -v "$PWD:/work:ro" "$image" sh /work/build/smoke.sh /work/out "$ARCH"
+            docker run --rm --network none --read-only -v "$scratch:/tmp" -v "$PWD:/work:ro" "$image" sh /work/build/smoke.sh /work/out "$ARCH"
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -90,4 +104,12 @@ jobs:
           git config user.email linuxbench-build@users.noreply.github.com
           git add vendor
           git commit -m "Archive tested portable dependency build $id"
+          ref=$(git rev-parse HEAD)
+          amd=$(sha256sum "vendor/manifests/$id.amd64.tsv" | cut -d' ' -f1)
+          arm=$(sha256sum "vendor/manifests/$id.arm64.tsv" | cut -d' ' -f1)
+          test "$(grep -c '^APPROVED_REF=' linuxbench.sh)" -eq 1
+          sed -i "s/^APPROVED_REF=.*/APPROVED_REF=$ref; APPROVED_BUILD=$id; APPROVED_AMD64_HASH=$amd; APPROVED_ARM64_HASH=$arm/" linuxbench.sh
+          bash -n linuxbench.sh
+          git add linuxbench.sh
+          git commit -m "Bind approved portable build $id"
           git push origin HEAD:main
