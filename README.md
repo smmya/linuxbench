@@ -1,0 +1,34 @@
+# LinuxBench
+
+Lightweight Bash benchmark runner for Linux servers. Initial development version 0.1.0; not yet production-validated.
+
+## Usage
+
+Download and inspect linuxbench.sh before running. No arguments opens an interactive menu using the controlling terminal.
+
+```bash
+bash linuxbench.sh
+bash linuxbench.sh --quick
+bash linuxbench.sh --disk --disk-dir /data --size-mib 256
+bash linuxbench.sh --network --node tokyo
+bash linuxbench.sh --network --accept-ookla
+bash linuxbench.sh --help
+```
+
+## Dependencies
+
+Bash and ordinary Linux utilities for system information. Optional fio, jq, sysbench and GNU timeout for benchmarks. Install these independently from trusted distribution packages; LinuxBench never installs packages. Official Ookla Speedtest CLI is the sole proprietary dependency and must be obtained and verified independently from https://www.speedtest.net/apps/cli . A version string check is not cryptographic verification. Do not run network benchmarks as root. Do not use the unrelated Python speedtest-cli package.
+
+Ookla usage is subject to applicable license and privacy terms. Explicit consent is required before running. Ookla may transmit IP and test results. Nine tests may consume many gigabytes; per-node timeout is not a hard traffic cap.
+
+## Nodes
+
+London, Frankfurt, Los Angeles, New York, Shanghai, Guangzhou, Singapore, Tokyo, Johannesburg. IDs in the script are provisional candidates, NOT live-verified. No automatic geographic fallback. Review provider and city before relying on measurements.
+
+## Security
+
+No remote executable download, package installation, system configuration changes or benchmark report upload by the wrapper itself. Disk tests use a private temporary file and require at least 1 GiB additional free space, but can still affect production workloads. CPU tests cap threads at eight. Network tests are sequential with timeouts. Neither third-party binaries nor dependencies have been independently audited here. The current implementation has not passed a live test matrix or ShellCheck yet. No signed release is available.
+
+## Status
+
+Early development. Test on disposable systems first. Debian 12/13 are initial compatibility targets. Node availability, geography, license terms, and actual resource consumption require verification.
